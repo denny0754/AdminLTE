@@ -8,6 +8,7 @@
 
 $api = true;
 header('Content-type: application/json');
+require("scripts/pi-hole/php/database.php");
 require("scripts/pi-hole/php/password.php");
 require("scripts/pi-hole/php/auth.php");
 check_cors();
@@ -48,7 +49,7 @@ function resolveHostname($clientip, $printIP)
 	return $clientname;
 }
 
-// Get posible non-standard location of FTL's database
+// Get possible non-standard location of FTL's database
 $FTLsettings = parse_ini_file("/etc/pihole/pihole-FTL.conf");
 if(isset($FTLsettings["DBFILE"]))
 {
@@ -62,37 +63,7 @@ else
 // Needs package php5-sqlite, e.g.
 //    sudo apt-get install php5-sqlite
 
-function SQLite3_connect($trytoreconnect)
-{
-	global $DBFILE;
-	try
-	{
-		// connect to database
-		return new SQLite3($DBFILE, SQLITE3_OPEN_READONLY);
-	}
-	catch (Exception $exception)
-	{
-		// sqlite3 throws an exception when it is unable to connect, try to reconnect after 3 seconds
-		if($trytoreconnect)
-		{
-			sleep(3);
-			$db = SQLite3_connect(false);
-		}
-	}
-}
-
-if(strlen($DBFILE) > 0)
-{
-	$db = SQLite3_connect(true);
-}
-else
-{
-	die("No database available");
-}
-if(!$db)
-{
-	die("Error connecting to database");
-}
+$db = SQLite3_connect($DBFILE);
 
 if(isset($_GET["network"]) && $auth)
 {
@@ -100,7 +71,16 @@ if(isset($_GET["network"]) && $auth)
 	$results = $db->query('SELECT * FROM network');
 
 	while($results !== false && $res = $results->fetchArray(SQLITE3_ASSOC))
+	{
+		$id = $res["id"];
+		// Empty array for holding the IP addresses
+		$res["ip"] = array();
+		// Get IP addresses for this device
+		$network_addresses = $db->query("SELECT ip FROM network_addresses WHERE network_id = $id ORDER BY lastSeen DESC");
+		while($network_addresses !== false && $ip = $network_addresses->fetchArray(SQLITE3_ASSOC))
+			array_push($res["ip"],$ip["ip"]);
 		array_push($network, $res);
+	}
 
 	$data = array_merge($data, array('network' => $network));
 }
@@ -378,35 +358,31 @@ if (isset($_GET['getGraphData']) && $auth)
 			$interval = $q;
 	}
 
+	// Round $from and $until to match the requested $interval
+	$from = intval((intval($_GET['from'])/$interval)*$interval);
+	$until = intval((intval($_GET['until'])/$interval)*$interval);
+
 	// Count permitted queries in intervals
 	$stmt = $db->prepare('SELECT (timestamp/:interval)*:interval interval, COUNT(*) FROM queries WHERE (status != 0 )'.$limit.' GROUP by interval ORDER by interval');
-	$stmt->bindValue(":from", intval($_GET['from']), SQLITE3_INTEGER);
-	$stmt->bindValue(":until", intval($_GET['until']), SQLITE3_INTEGER);
+	$stmt->bindValue(":from", $from, SQLITE3_INTEGER);
+	$stmt->bindValue(":until", $until, SQLITE3_INTEGER);
 	$stmt->bindValue(":interval", $interval, SQLITE3_INTEGER);
 	$results = $stmt->execute();
 
-	// Parse the DB result into graph data, filling in missing sections with zero
-	function parseDBData($results, $interval) {
+	// Parse the DB result into graph data, filling in missing interval sections with zero
+	function parseDBData($results, $interval, $from, $until) {
 		$data = array();
-		$min = null;
-		$max = null;
 
 		if(!is_bool($results)) {
 			// Read in the data
 			while($row = $results->fetchArray()) {
-				// Get min and max timestamps
-				if($min === null || $min > $row[0])
-					$min = $row[0];
-
-				if($max === null || $max < $row[0])
-					$max = $row[0];
-
-				// Get the non-zero graph data
+				// $data[timestamp] = value_in_this_interval
 				$data[$row[0]] = intval($row[1]);
 			}
 
 			// Fill the missing intervals with zero
-			for($i = $min; $i < $max; $i += $interval) {
+			// Advance in steps of interval
+			for($i = $from; $i < $until; $i += $interval) {
 				if(!array_key_exists($i, $data))
 					$data[$i] = 0;
 			}
@@ -415,19 +391,19 @@ if (isset($_GET['getGraphData']) && $auth)
 		return $data;
 	}
 
-	$domains = parseDBData($results, $interval);
+	$domains = parseDBData($results, $interval, $from, $until);
 
 	$result = array('domains_over_time' => $domains);
 	$data = array_merge($data, $result);
 
 	// Count blocked queries in intervals
 	$stmt = $db->prepare('SELECT (timestamp/:interval)*:interval interval, COUNT(*) FROM queries WHERE (status == 1 OR status == 4 OR status == 5)'.$limit.' GROUP by interval ORDER by interval');
-	$stmt->bindValue(":from", intval($_GET['from']), SQLITE3_INTEGER);
-	$stmt->bindValue(":until", intval($_GET['until']), SQLITE3_INTEGER);
+	$stmt->bindValue(":from", $from, SQLITE3_INTEGER);
+	$stmt->bindValue(":until", $until, SQLITE3_INTEGER);
 	$stmt->bindValue(":interval", $interval, SQLITE3_INTEGER);
 	$results = $stmt->execute();
 
-	$addomains = parseDBData($results, $interval);
+	$addomains = parseDBData($results, $interval, $from, $until);
 
 	$result = array('ads_over_time' => $addomains);
 	$data = array_merge($data, $result);

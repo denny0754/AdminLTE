@@ -56,6 +56,16 @@ function validMAC($mac_addr)
   return (preg_match('/([a-fA-F0-9]{2}[:]?){6}/', $mac_addr) == 1);
 }
 
+function validEmail($email)
+{
+	return filter_var($email, FILTER_VALIDATE_EMAIL)
+		// Make sure that the email does not contain special characters which
+		// may be used to execute shell commands, even though they may be valid
+		// in an email address. If the escaped email does not equal the original
+		// email, it is not safe to store in setupVars.
+		&& escapeshellcmd($email) === $email;
+}
+
 $dhcp_static_leases = array();
 function readStaticLeasesFile()
 {
@@ -155,37 +165,22 @@ function readDNSserversList()
 	return $list;
 }
 
+require_once("database.php");
 $adlist = [];
 function readAdlists()
 {
 	// Reset list
 	$list = [];
-	$handle = @fopen("/etc/pihole/adlists.list", "r");
-	if ($handle)
+	$db = SQLite3_connect(getGravityDBFilename());
+	if ($db)
 	{
-		while (($line = fgets($handle)) !== false)
+		$results = $db->query("SELECT * FROM adlist");
+
+		while($results !== false && $res = $results->fetchArray(SQLITE3_ASSOC))
 		{
-			if(strlen($line) < 3)
-			{
-				continue;
-			}
-			elseif($line[0] === "#")
-			{
-				// Comments start either with "##" or "# "
-				if($line[1] !== "#" &&
-				   $line[1] !== " ")
-				{
-					// Commented list
-					array_push($list, [false,rtrim(substr($line, 1))]);
-				}
-			}
-			else
-			{
-				// Active list
-				array_push($list, [true,rtrim($line)]);
-			}
+			array_push($list, $res);
 		}
-		fclose($handle);
+		$db->close();
 	}
 	return $list;
 }
@@ -496,7 +491,7 @@ function readAdlists()
 				{
 					$adminemail = 'noadminemail';
 				}
-				elseif(!filter_var($adminemail, FILTER_VALIDATE_EMAIL) || strpos($adminemail, "'") !== false)
+				elseif(!validEmail($adminemail))
 				{
 					$error .= "Administrator email address (".htmlspecialchars($adminemail).") is invalid!<br>";
 				}
@@ -570,7 +565,7 @@ function readAdlists()
 					if(strlen($ip) == 0)
 						$ip = "noip";
 
-					// Test if this MAC address is already included
+					// Test if this lease is already included
 					readStaticLeasesFile();
 					foreach($dhcp_static_leases as $lease) {
 						if($lease["hwaddr"] === $mac)
@@ -581,6 +576,11 @@ function readAdlists()
 						if($ip !== "noip" && $lease["IP"] === $ip)
 						{
 							$error .= "Static lease for IP address (".htmlspecialchars($ip).") already defined!<br>";
+							break;
+						}
+						if($lease["host"] === $hostname)
+						{
+							$error .= "Static lease for hostname (".htmlspecialchars($hostname).") already defined!<br>";
 							break;
 						}
 					}
@@ -689,18 +689,18 @@ function readAdlists()
 					if(isset($_POST["adlist-del-".$key]))
 					{
 						// Delete list
-						exec("sudo pihole -a adlist del ".escapeshellcmd($value[1]));
+						exec("sudo pihole -a adlist del ".escapeshellcmd($value["address"]));
 					}
-					elseif(isset($_POST["adlist-enable-".$key]) && !$value[0])
+					elseif(isset($_POST["adlist-enable-".$key]) && $value["enabled"] !== 1)
 					{
 						// Is not enabled, but should be
-						exec("sudo pihole -a adlist enable ".escapeshellcmd($value[1]));
+						exec("sudo pihole -a adlist enable ".escapeshellcmd($value["address"]));
 
 					}
-					elseif(!isset($_POST["adlist-enable-".$key]) && $value[0])
+					elseif(!isset($_POST["adlist-enable-".$key]) && $value["enabled"] === 1)
 					{
 						// Is enabled, but shouldn't be
-						exec("sudo pihole -a adlist disable ".escapeshellcmd($value[1]));
+						exec("sudo pihole -a adlist disable ".escapeshellcmd($value["address"]));
 					}
 				}
 
@@ -748,6 +748,15 @@ function readAdlists()
 				else
 				{
 					$error .= "Invalid privacy level (".$level.")!";
+				}
+				break;
+			// Flush network table
+			case "flusharp":
+				exec("sudo pihole arpflush quiet", $output);
+				$error = implode("<br>", $output);
+				if(strlen($error) == 0)
+				{
+					$success .= "The network table has been flushed";
 				}
 				break;
 
